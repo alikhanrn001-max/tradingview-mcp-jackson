@@ -7,6 +7,7 @@
 // Usage: node scripts/export_ohlcv.js [--symbol OANDA:XAUUSD] [--timeframes 15,60] [--out exports]
 import { mkdirSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
+import { pathToFileURL } from 'url';
 import { evaluate, disconnect, KNOWN_PATHS } from '../src/connection.js';
 import { setTimeframe, getVisibleRange, setVisibleRange } from '../src/core/chart.js';
 
@@ -95,16 +96,23 @@ function isScheduledClosure(unixSeconds) {
   return hour === 17;
 }
 
+// The 3m series opens each session at 22:03, not 22:00. Its first bars rebuild the 15m session-open
+// bar exactly, so no data is lost. Only that single slot is excused; anything wider is still a gap.
+function isLateSessionOpen(slot, nextBarTime, secondsPerBar) {
+  return secondsPerBar === 180 && slot + secondsPerBar === nextBarTime && isScheduledClosure(slot - secondsPerBar);
+}
+
 function iso(unixSeconds) {
   return new Date(unixSeconds * 1000).toISOString();
 }
 
-function checkBars(bars, secondsPerBar) {
+export function checkBars(bars, secondsPerBar) {
   const issues = { out_of_order: [], duplicates: [], misaligned: [], bad_values: [], ohlc_inconsistent: [] };
   const unexplainedGaps = [];
   let scheduledGaps = 0;
   let scheduledMissingBars = 0;
   let unexplainedMissingBars = 0;
+  let lateSessionOpenBars = 0;
   let zeroVolumeBars = 0;
 
   bars.forEach(([time, open, high, low, close, volume], i) => {
@@ -124,16 +132,20 @@ function checkBars(bars, secondsPerBar) {
     else if (time - prev > secondsPerBar) {
       let missing = 0;
       let unexplained = 0;
+      let late = 0;
       for (let t = prev + secondsPerBar; t < time; t += secondsPerBar) {
         missing++;
-        if (!isScheduledClosure(t)) unexplained++;
+        if (isScheduledClosure(t)) continue;
+        if (isLateSessionOpen(t, time, secondsPerBar)) late++;
+        else unexplained++;
       }
       if (unexplained === 0) {
         scheduledGaps++;
-        scheduledMissingBars += missing;
+        scheduledMissingBars += missing - late;
+        lateSessionOpenBars += late;
       } else {
-        unexplainedMissingBars += unexplained;
-        unexplainedGaps.push({ after: iso(prev), before: iso(time), missing_bars: missing, outside_schedule: unexplained });
+        unexplainedMissingBars += unexplained + late;
+        unexplainedGaps.push({ after: iso(prev), before: iso(time), missing_bars: missing, outside_schedule: unexplained + late });
       }
     }
   });
@@ -143,6 +155,7 @@ function checkBars(bars, secondsPerBar) {
     zero_volume_bars: zeroVolumeBars,
     scheduled_gaps: scheduledGaps,
     scheduled_missing_bars: scheduledMissingBars,
+    late_session_open_bars: lateSessionOpenBars,
     unexplained_gap_count: unexplainedGaps.length,
     unexplained_missing_bars: unexplainedMissingBars,
     unexplained_gaps: unexplainedGaps,
@@ -250,11 +263,14 @@ async function main() {
   console.log(`Output directory: ${outDir}`);
 }
 
-try {
-  await main();
-} catch (err) {
-  console.error(`Export failed: ${err.message}`);
-  process.exitCode = 1;
-} finally {
-  await disconnect();
+// Only export when run directly, so importing checkBars never touches the chart.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    await main();
+  } catch (err) {
+    console.error(`Export failed: ${err.message}`);
+    process.exitCode = 1;
+  } finally {
+    await disconnect();
+  }
 }
